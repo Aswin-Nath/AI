@@ -1,8 +1,6 @@
 {
   "dockerfile_lines": [],
   "graphs": {
-    "explain_question": "./graphs/QA.py:graph",
-    "decision_maker":"./graphs/decision_maker.py:graph",
     "LearnWithAI":"./graphs/LearnWithAI_.py:graph"
   },
   "env": "./.env",

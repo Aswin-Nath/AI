@@ -1,282 +1,423 @@
-from langgraph.graph import StateGraph,START,END
-from typing import TypedDict,Optional,Literal
-from pydantic import BaseModel,Field
+from langgraph.graph import StateGraph, START, END
+from typing import TypedDict, Optional, Literal
+from pydantic import BaseModel, Field
+from sqlalchemy.engine import URL
+from sqlalchemy import create_engine, text
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
-import os
+from langchain_core.output_parsers import JsonOutputParser
 from dotenv import load_dotenv
-load_dotenv()
-GROQ_KEY=os.getenv("GROQ_API_KEY")
-# Initialize Groq LLM
-model="llama-3.1-8b-instant"
-llm = ChatGroq(
-    api_key=GROQ_KEY,
-    model_name=model,
-    temperature=0
-)
-from IPython.display import display,Markdown
-class InputState(TypedDict,total=False):
-    user_query:str
-    user_code:Optional[str]
-    problem_id:Optional[int]
+import os
 
-class OutputState(TypedDict):
-    user_query:str
-    user_code:Optional[str]
-    problem_id:Optional[int]
-    answer:str
+load_dotenv()
+
+# ===============================
+# 1. SETUP
+# ===============================
+GROQ_KEY = os.getenv("GROQ_API_KEY")
+# Using a standard chat model setup
+llm = ChatGroq(api_key=GROQ_KEY, model_name="llama-3.1-8b-instant", temperature=0)
+
+url = URL.create(
+    drivername="postgresql+psycopg2",
+    username="postgres",
+    password="aswinnath@123",
+    host="localhost",
+    port=1024,
+    database="ticket_raiser",
+)
+engine = create_engine(url)
+
+def get_problem_by_id(problem_id: int):
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT id, title, description FROM problems WHERE id = :pid"),
+            {"pid": problem_id}
+        )
+        row = result.fetchone()
+        if not row: return None
+        return {"id": row.id, "title": row.title, "description": row.description}
+
+# ===============================
+# 2. STATE DEFINITIONS
+# ===============================
+class InputState(TypedDict):
+    user_intent: Literal[
+        "how_to_solve_this", "why_my_code_failed", "explain_my_code", 
+        "validate_my_approach", "clarification_request"
+    ]
+    user_query: Optional[str]
+    user_code: Optional[str]
+    problem_id: int
 
 class GraphState(TypedDict):
-    user_query:str
-    user_code:Optional[str]
-    user_intent:str
-    problem_id:Optional[int]
-    answer:Optional[str]
-    reasoning:str
-
-build=StateGraph(GraphState,input_schema=InputState,output_schema=OutputState)
-
-class ProblemMetadata:
-    description:str
-    title:str
-    constraints:str
-    difficulty:str
-    time_limit_ms:str
-
-# --- Intent Classification Schema ---
-class UserIntent(BaseModel):
-    """Classify the user's intent based on their query and code."""
-    
-    user_intent: Literal[
-        "how_to_solve_this", 
-        "why_my_code_failed", 
-        "explain_my_code", 
-        "validate_my_approach", 
-        "clarification_request", 
-        "general_dsa_concept", 
-        "i_cant_answer_to_this"
-    ] = Field(..., description="The classified intent of the user.")
-    
-    reasoning: str = Field(..., description="Brief reason why this intent was chosen.")
-
-def query_intent(state: InputState) -> dict:
-    structured_llm = llm.with_structured_output(UserIntent)
-    
-    user_query = state.get("user_query", "")
-    user_code = state.get("user_code", None)
-
-    system_prompt = """You are a highly specialized Competitive Programming (CP) Assistant. Your SOLE purpose is to assist with algorithmic problems (LeetCode, Codeforces, AtCoder) and Data Structures & Algorithms (DSA).
-
-    You operate under a STRICT "White-list" policy. If a query does not fall into the specific domains of Algorithms, Data Structures, or Problem Solving logic, you MUST classify it as 'i_cant_answer_to_this'.
-
-    Classify the user's intent into exactly one of these categories:
-
-    1. 'how_to_solve_this': 
-       - User asks for hints, approach, or strategy for a specific algorithmic problem.
-       - Logic: "How do I approach this?", "Any hints for LeetCode 123?"
-
-    2. 'why_my_code_failed': 
-       - User provides code that is failing (WA/TLE/RE) on a judge and asks why.
-       - Logic: MUST have user_code OR reference a verdict (e.g., "Getting TLE").
-
-    3. 'explain_my_code': 
-       - User asks to explain the logic, flow, or complexity of a provided code snippet.
-
-    4. 'validate_my_approach': 
-       - User proposes a specific algorithm/idea (e.g., "Greedy", "DP") and asks if it is valid for a problem.
-
-    5. 'clarification_request': 
-       - STRICTLY for doubts about a problem's constraints, input format, or edge cases.
-       - Example: "Is N up to 10^5?", "Can the array be empty?"
-
-    6. 'general_dsa_concept': 
-       - Theoretical questions about DSA concepts (Sorting, Graphs, DP, Trees).
-       - Example: "How does Dijkstra work?", "Time complexity of Merge Sort?"
-
-    7. 'i_cant_answer_to_this': 
-       - THE CATCH-ALL FOR EVERYTHING ELSE.
-       - REJECT General Programming: "How to center a div?", "How to install React?", "pandas vs numpy?", "How to build an API?"
-       - REJECT General Knowledge: History, politics, weather, sports, movies.
-       - REJECT Casual Chat: "Hi", "How are you?", "Tell me a joke" (unless accompanied by a problem).
-       - REJECT Homework/Math: "Solve this calculus integral", "Write an essay".
-       
-    *** IMPORTANT DECISION RULES ***
-    - If the query is technical (e.g., "How to fix this CSS?") but NOT about Algorithms/DSA -> 'i_cant_answer_to_this'.
-    - If the query is about a specific library/framework (React, Django, Spring, Pandas) -> 'i_cant_answer_to_this'.
-    - If you are unsure if it relates to Competitive Programming, CHOOSE 'i_cant_answer_to_this'.
-    """
-
-
-    messages = [
-        ("system", system_prompt),
-        ("human", "User Query: {user_query}\n\nUser Code: {user_code}")
+    user_intent: str
+    user_query: str
+    user_code: str
+    problem_id: int
+    problem: Optional[dict]
+    answer: str
+    is_valid: bool
+    fallback_message: str
+    violation_type: Literal[
+        "solution_begging",
+        "no_input",
+        "off_topic",
+        "wrong_button",
+        "ambiguous",
+        "ok"
     ]
-    prompt = ChatPromptTemplate.from_messages(messages)
 
-    chain = prompt | structured_llm
+class OutputState(TypedDict):
+    answer: str
+
+# Defined for the parser to know the schema
+class GuardDecision(BaseModel):
+    is_valid: bool = Field(..., description="true if valid, false if blocked")
+    fallback_message: str = Field(..., description="Helpful message if blocked, empty string if valid")
+    violation_type: Literal[
+        "solution_begging",
+        "no_input",
+        "off_topic",
+        "wrong_button",
+        "ambiguous",
+        "ok"
+    ] = Field(default="ok", description="Type of violation for analytics")
+
+# ===============================
+# 3. SETUP NODE
+# ===============================
+def setup_node(state: InputState) -> GraphState:
+    problem = get_problem_by_id(state["problem_id"])
+    return {
+        "user_intent": state["user_intent"],
+        "user_query": state.get("user_query", "").strip(),
+        "user_code": state.get("user_code", "").strip(),
+        "problem_id": state["problem_id"],
+        "problem": problem,
+        "answer": "",
+        "is_valid": True,
+        "fallback_message": "",
+        "violation_type": "ok"
+    }
+
+# ===============================
+# 4. GLOBAL GUARDRAIL CONSTANTS
+# ===============================
+GLOBAL_OFF_TOPIC = (
+    "I can only help with this coding problem. "
+    "Please ask about the problem, your code, or your approach."
+)
+
+AMBIGUOUS_CLARIFY = (
+    "Could you clarify what you mean? "
+    "For example, are you asking about specific constraints, data properties, or guarantees?"
+)
+
+# ===============================
+# 5. LLM GUARDRAILS (WITH STRICT FALLBACKS)
+# ===============================
+def run_guard_llm(system_prompt: str, user_input: str) -> dict:
+    structured_llm = llm.with_structured_output(GuardDecision)
+    prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", user_input)])
+    try:
+        result: GuardDecision = (prompt | structured_llm).invoke({})
+        return {
+            "is_valid": result.is_valid,
+            "fallback_message": result.fallback_message,
+            "violation_type": result.violation_type
+        }
+    except Exception:
+        return {
+            "is_valid": False,
+            "fallback_message": "I couldn't interpret that clearly. Could you rephrase?",
+            "violation_type": "ambiguous"
+        }
+
+def guard_how_to_solve(state: GraphState) -> GraphState:
+    # FIRST: Check for empty/whitespace-only input
+    if not state['user_query'] or not state['user_query'].strip():
+        return {**state, "is_valid": False, "fallback_message": "Could you clarify what you'd like help with?", "violation_type": "no_input"}
     
-    result: UserIntent = chain.invoke({
-        "user_query": user_query, 
-        "user_code": "No code provided" if not user_code else user_code
-    })
+    # Use LLM with lenient prompt - user already clicked Hint button, so assume good faith
+    prompt = """
+You are a lenient validator for "Get Hint" requests on a coding problem.
 
-    return {
-        "user_intent": result.user_intent,
-        "user_query": user_query,
-        "user_code": user_code,
-        "problem_id": state.get("problem_id",None),
-        "reasoning":result.reasoning
-    }
+User already clicked the "Get Hint" button, so assume they want help understanding the problem/approach.
 
-def handle_how_to_solve_this(state: GraphState) -> GraphState:
-    return {
-        **state,
-        "answer": "handle_how_to_solve_this"
-    }
+ACCEPT (is_valid=true) if user is asking about:
+- Approach, strategy, or hints for solving
+- How to think about the problem
+- What concepts apply
+- Any question about the problem or their thinking process
 
+ONLY REJECT (is_valid=false) if user explicitly asks for:
+- Complete solution code ("give me the code", "write the solution")
+- Or completely off-topic garbage that has nothing to do with programming/this problem
 
-def handle_why_my_code_failed(state: GraphState) -> GraphState:
-    return {
-        **state,
-        "answer": "handle_why_my_code_failed"
-    }
+Default: ACCEPT. Be generous. User clicked Hint button for a reason.
 
+If INVALID:
+- violation_type = "solution_begging" (if asking for code) or "off_topic" (if irrelevant)
+- fallback_message = "I can only help with this coding problem. Please ask about the problem, your code, or your approach."
 
-def handle_explain_my_code(state: GraphState) -> GraphState:
-    return {
-        **state,
-        "answer": "handle_explain_my_code"
-    }
+If VALID:
+- is_valid = true
+- fallback_message = ""
+- violation_type = "ok"
+"""
 
+    res = run_guard_llm(prompt, f"Query: {state['user_query']}")
+    return {**state, **res}
 
-def handle_validate_my_approach(state: GraphState) -> GraphState:
-    return {
-        **state,
-        "answer": "handle_validate_my_approach"
-    }
-
-
-def handle_general_dsa_concept(state: GraphState) -> OutputState:
-    user_query = state.get("user_query", "")
+def guard_why_failed(state: GraphState) -> GraphState:
+    # FIRST: Check if code is present and non-trivial
+    code = state['user_code'].strip()
     
-    # Improved Prompt: Includes TL;DR at start and Summary at end
-    prompt = ChatPromptTemplate.from_template(
-        """You are an elite Competitive Programming Coach.
-        The user wants a deep-dive explanation of the concept: "{user_query}"
+    if not code:
+        return {**state, "is_valid": False, "fallback_message": "Please paste your code so I can help debug", "violation_type": "no_input"}
+    
+    # Check code substantiality: multiline counts as substantial, single line needs length >= 15
+    lines = [l.strip() for l in code.split('\n') if l.strip() and not l.strip().startswith('#')]
+    is_substantial = len(lines) > 1 or (len(lines) == 1 and len(lines[0]) > 15)
+    
+    if not is_substantial:
+        return {**state, "is_valid": False, "fallback_message": "Please paste your code so I can help debug", "violation_type": "no_input"}
+    
+    # Use VERY lenient LLM - code is already substantial
+    prompt = """
+Determine if this is a VALID debug/analysis request.
 
-        Your Goal: Provide a comprehensive, top-to-bottom guide suitable for a coder preparing for contests like Codeforces or LeetCode.
+Code is substantial. User is asking about it.
 
-        Structure your response strictly as follows:
+VALID QUERIES (Accept all of these):
+- Error messages: "Stack overflow", "IndexError", "TLE", "Memory error", "Runtime error"
+- Analysis: "Why does this fail?", "What's wrong?", "Why wrong answer?"
+- Performance: "Too slow", "Memory limit exceeded"
+- ANY question about their code: "How does this fail?", "Why does this not work?"
 
-        ### 0. TL;DR
-        - A 2-sentence high-level summary of what this algorithm/concept is and its primary use case. 
-        - (Target audience: Experts who just need a refresher).
+VALID because code is present.
 
-        ### 1. The "Big Idea" (Intuition)
-        - Explain the concept simply without jargon first.
-        - Use an analogy if helpful.
-        - Why does this exist? What problem does it solve efficiently?
+INVALID only if:
+- "just solve it" or "give me answer" → violation_type = solution_begging
+- Completely off-topic and unrelated to code ("what is life?") → violation_type = off_topic
 
-        ### 2. How It Works (The Algorithm)
-        - Briefly describe the step-by-step logical flow.
-        - Mention the underlying data structures used (e.g., "Uses a Min-Heap," "Relies on Recursion + Memoization").
+ASSUME GOOD FAITH: User provided code to debug.
 
-        ### 3. Complexity Analysis
-        - **Time Complexity**: Best, Average, and Worst case (with brief reasoning).
-        - **Space Complexity**: Auxiliary space required.
+Output:
+- is_valid: true or false
+- fallback_message: (empty if valid; explain why if invalid)
+- violation_type: "ok", "solution_begging", or "off_topic"
+"""
 
-        ### 4. Implementation Pattern (Python)
-        - Provide a concise, standard "template" code snippet in Python.
-        - Ensure the code is clean, commented, and follows standard CP practices.
-        - DO NOT omit this section.
+    input_text = f"Query: {state['user_query']}"
+    res = run_guard_llm(prompt, input_text)
+    return {**state, **res}
 
-        ### 5. When to Use (Pattern Recognition)
-        - List specific problem constraints or keywords that signal this approach (e.g., "N <= 10^5", "Shortest path with non-negative weights").
+def guard_explain_code(state: GraphState) -> GraphState:
+    # FIRST: Check if code is present AND non-trivial
+    code = state['user_code'].strip()
+    query = state['user_query'].strip()
+    
+    if not code or len(code) == 0:
+        return {**state, "is_valid": False, "fallback_message": "Please paste the code you'd like me to explain", "violation_type": "no_input"}
+    
+    # Reject single-character or trivial code (single variable)
+    if len(code) <= 2 or code in ['x', 'y', 'n', 'i', 'j', 'a', 'b']:
+        return {**state, "is_valid": False, "fallback_message": "Please paste the code you'd like me to explain", "violation_type": "no_input"}
+    
+    # If query is present, validate it's actually asking for explanation (not clarification/off-topic)
+    if query:
+        prompt = """
+You are a validator for "Explain Code" requests.
 
-        ### 6. Common Pitfalls & Edge Cases
-        - What usually breaks this algorithm? (e.g., "Integer overflow," "Negative cycles," "Recursion depth limit").
+User pasted code and is asking a question about it.
 
-        ### 7. Summary
-        - One final "Golden Rule" or key takeaway to remember about this concept during a contest.
+VALID (is_valid=true) if user is asking:
+- Explanation of how code works
+- What specific lines/functions do
+- How this approach solves the DSA problem
+- Why specific logic is used
+- Time/space complexity
+- How to optimize code
 
-        Keep the tone professional, encouraging, and highly technical.
-        """
+INVALID (is_valid=false) if user is:
+- Asking clarification about problem (ask in Clarify button)
+- Asking about problem constraints/format (ask in Clarify button)
+- Asking definitions or theory (ask in Clarify button)
+- Asking off-topic question unrelated to their code
+- Asking to debug/fix the code (ask in Debug button)
+
+Be strict: If it's clarification or off-topic, reject it.
+
+Output:
+- is_valid: true or false
+- fallback_message: "For problem clarification, use the Clarify button" (if clarification) or "Please ask about your code" (if off-topic)
+- violation_type: "wrong_button" (if clarification) or "off_topic" (if unrelated)
+"""
+        res = run_guard_llm(prompt, f"Code: {code}\nQuery: {query}")
+        return {**state, **res}
+    
+    # No query provided - code alone is sufficient for explanation
+    return {**state, "is_valid": True, "fallback_message": "", "violation_type": "ok"}
+
+def guard_validate_approach(state: GraphState) -> GraphState:
+    query = state['user_query'].strip()
+    code = state['user_code'].strip()
+    
+    # FIRST: Check for empty input - accept if either query OR code is present
+    if not query and not code:
+        return {**state, "is_valid": False, "fallback_message": "Please share your approach idea or code", "violation_type": "no_input"}
+    
+    # If code is present without query, accept it - can infer approach from code
+    if code and not query:
+        return {**state, "is_valid": True, "fallback_message": "", "violation_type": "ok"}
+    
+    prompt = """
+You are a lenient validator for approach validation requests.
+
+User clicked "Validate" button to check if their idea makes sense for the problem.
+
+ACCEPT (is_valid=true) if user is:
+- Proposing an approach ("Can I use...?", "Should I...?")
+- Classifying the problem type ("Is this a Graph problem?", "Is this DP?")
+- Asking about feasibility of an idea
+- Asking about complexity/efficiency
+- Any question that shows they're thinking about the problem
+
+ONLY REJECT (is_valid=false) if user:
+- Explicitly asks for solution code
+- Asks for hints (that's the Hint button)
+- Provides no input at all (no_input)
+- Completely off-topic
+
+Default: ACCEPT. User clicked Validate button, so accept their approach questions.
+
+If INVALID:
+- is_valid = false
+- violation_type = "no_input" (if empty), "wrong_button" (if asking for hints), or "solution_begging" (if asking for code)
+
+If VALID:
+- is_valid = true
+- fallback_message = ""
+- violation_type = "ok"
+"""
+
+
+    res = run_guard_llm(prompt, f"Query: {state['user_query']}")
+    return {**state, **res}
+
+def guard_clarification(state: GraphState) -> GraphState:
+    # Check for empty input
+    if not state['user_query'] or not state['user_query'].strip():
+        return {**state, "is_valid": False, "fallback_message": "Please ask a question about the problem statement.", "violation_type": "no_input"}
+    
+    # Use lenient LLM - accept most clarification-related questions
+    prompt = """
+You are a lenient validator for problem clarification requests.
+
+User clicked the "Clarify" button to understand the problem better.
+
+ACCEPT (is_valid=true) if user is asking about:
+- Problem details, constraints, data properties
+- Input/output format
+- What terms mean
+- Examples or test cases
+- Any aspect of understanding the problem statement
+
+ONLY REJECT (is_valid=false) if user explicitly asks for:
+- How to solve (that's the Hint button)
+- Algorithm or approach advice (that's Validate button)
+- Complete solution (that's never allowed)
+- Completely off-topic nonsense unrelated to the problem
+
+Default: ACCEPT. User clicked Clarify for a reason.
+
+If INVALID:
+- violation_type = "wrong_button" (if asking how to solve)
+- fallback_message = "For solution guidance, use the Hint button. Here, I can clarify problem details."
+
+If VALID:
+- is_valid = true
+- fallback_message = ""
+- violation_type = "ok"
+"""
+
+    res = run_guard_llm(prompt, f"Query: {state['user_query']}")
+    return {**state, **res}
+
+# ===============================
+# 6. HANDLERS & FALLBACK
+# ===============================
+def handle_how_to_solve_this(state: GraphState): return {**state, "answer": "LLM: Generating Hint..."}
+def handle_why_my_code_failed(state: GraphState): return {**state, "answer": "LLM: Analyzing Bug..."}
+def handle_explain_my_code(state: GraphState): return {**state, "answer": "LLM: Explaining Code..."}
+def handle_validate_my_approach(state: GraphState): return {**state, "answer": "LLM: Validating Idea..."}
+def handle_clarification_request(state: GraphState): return {**state, "answer": "LLM: Clarifying Constraints..."}
+
+def handle_fallback(state: GraphState) -> GraphState:
+    return {**state, "answer": state["fallback_message"]}
+
+# ===============================
+# 7. GRAPH BUILD
+# ===============================
+build = StateGraph(GraphState, input_schema=InputState, output_schema=OutputState)
+
+build.add_node("setup", setup_node)
+
+# Guards
+build.add_node("guard_how_to_solve", guard_how_to_solve)
+build.add_node("guard_why_failed", guard_why_failed)
+build.add_node("guard_explain_code", guard_explain_code)
+build.add_node("guard_validate", guard_validate_approach)
+build.add_node("guard_clarification", guard_clarification)
+
+# Handlers
+build.add_node("handle_how_to_solve", handle_how_to_solve_this)
+build.add_node("handle_why_failed", handle_why_my_code_failed)
+build.add_node("handle_explain", handle_explain_my_code)
+build.add_node("handle_validate", handle_validate_my_approach)
+build.add_node("handle_clarification", handle_clarification_request)
+build.add_node("handle_fallback", handle_fallback)
+
+build.add_edge(START, "setup")
+
+INTENT_TO_GUARD = {
+    "how_to_solve_this": "guard_how_to_solve",
+    "why_my_code_failed": "guard_why_failed",
+    "explain_my_code": "guard_explain_code",
+    "validate_my_approach": "guard_validate",
+    "clarification_request": "guard_clarification",
+}
+INTENT_TO_GUARD = {
+    "how_to_solve_this": "guard_how_to_solve",
+    "why_my_code_failed": "guard_why_failed",
+    "explain_my_code": "guard_explain_code",
+    "validate_my_approach": "guard_validate",
+    "clarification_request": "guard_clarification",
+}
+def route_to_guard(state: GraphState):
+    return state["user_intent"]
+build.add_conditional_edges("setup", route_to_guard,INTENT_TO_GUARD)
+
+def check_validity(state: GraphState):
+    return "proceed" if state["is_valid"] else "fallback"
+
+guards_to_handlers = {
+    "guard_how_to_solve": "handle_how_to_solve",
+    "guard_why_failed": "handle_why_failed",
+    "guard_explain_code": "handle_explain",
+    "guard_validate": "handle_validate",
+    "guard_clarification": "handle_clarification"
+}
+
+for guard, handler in guards_to_handlers.items():
+    build.add_conditional_edges(
+        guard,
+        check_validity,
+        {"proceed": handler, "fallback": "handle_fallback"}
     )
-    
-    # Execute chain
-    chain = prompt | llm
-    response = chain.invoke({"user_query": user_query})
-    
-    return {
-        "user_query": user_query,
-        "user_code": state.get("user_code"),
-        "problem_id": state.get("problem_id"),
-        "answer": response.content
-    }
+    build.add_edge(handler, END)
 
-def handle_clarification_request(state: GraphState) -> GraphState:
-    return {
-        **state,
-        "answer": "handle_clarification_request"
-    }
-
-
-def handle_cant_answer(state: GraphState) -> OutputState:
-    user_query = state.get("user_query", "")
-    
-    # 1. Strict refusal prompt
-    prompt = ChatPromptTemplate.from_template(
-        """You are a strict Competitive Programming Assistant (LeetCode/Codeforces expert).
-        
-        The user has asked a question that is OUT OF SCOPE for you: 
-        "{user_query}"
-        
-        Your task:
-        1. Politely decline to answer this specific question.
-        2. Remind the user that you can only assist with Data Structures, Algorithms, and Coding Problems.
-        3. Keep the response short (1-2 sentences).
-        4. Do NOT attempt to answer the off-topic question even slightly.
-        """
-    )
-    
-    chain = prompt | llm
-    response = chain.invoke({"user_query": user_query})
-    
-    return {
-        "user_query": user_query,
-        "user_code": state.get("user_code"),
-        "problem_id": state.get("problem_id"),
-        "answer": response.content 
-    }
-
-
-nodes_to_functions = [
-    ("how_to_solve_this", handle_how_to_solve_this),
-    ("why_my_code_failed", handle_why_my_code_failed),
-    ("explain_my_code", handle_explain_my_code),
-    ("validate_my_approach", handle_validate_my_approach),
-    ("general_dsa_concept", handle_general_dsa_concept),
-    ("clarification_request", handle_clarification_request),
-    ("i_cant_answer_to_this", handle_cant_answer),
-]
-for node,function_name in nodes_to_functions:
-    build.add_node(node,function_name)
-
-
-build.add_node("query_intent",query_intent)
-build.add_edge(START,"query_intent")
-build.add_conditional_edges("query_intent",lambda x:x["user_intent"],{node:node for node,_ in nodes_to_functions})
-for node,_ in nodes_to_functions:
-    build.add_edge(node,END)
-
-graph=build.compile()
-# Does Dijkstra work with negative edges?
-query="Does Dijkstra work with negative edges?"
-# "Who found Djikstras algo? and explain the use cases of this algo"
-response=graph.invoke({"user_query": query, "user_code": None})
-
-
-answer=response["answer"]
-
-
-display(Markdown(answer))
+build.add_edge("handle_fallback", END)
+graph = build.compile()
