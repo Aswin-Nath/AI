@@ -1,0 +1,14 @@
+langchain-chroma
+langchain-huggingface
+langchain-community
+langgraph
+pydantic
+sqlalchemy
+langchain-groq
+langchain-core
+python-dotenv
+langchain-text-splitters
+sentence-transformers
+faiss-cpu
+psycopg2-binary
+langgraph-checkpoint-sqlite
